@@ -1,6 +1,6 @@
 #!/usr/bin/env dotnet-script
 
-#r "nuget: YamlDotNet, 15.1.2"
+#r "nuget: VYaml, 0.25.0"
 #r "nuget: System.CommandLine, 2.0.0-beta4.22272.1"
 #r "nuget: System.Memory.Data, 8.0.0"
 #r "nuget: Microsoft.Extensions.Logging.Console, 8.0.0"
@@ -13,13 +13,12 @@ using System.CommandLine;
 using System.CommandLine.IO;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using YamlDotNet;
-using YamlDotNet.Core;
-using YamlDotNet.RepresentationModel;
+using VYaml;
 
 const string Version = "1.0.0";
 
@@ -143,6 +142,8 @@ public class GrammarGenerator(BinaryData YamlSpec, ILoggerFactory? loggerFactory
 {
     private ILogger Logger { get; } =
         loggerFactory?.CreateLogger<GrammarGenerator>() ?? new NullLogger<GrammarGenerator>();
+    /// <summary>Key: rule name; Value: rule number.</summary>
+    Dictionary<string, string> NamesIndex { get; set; } = [];
     public BinaryData YamlSpec { get; } = YamlSpec;
     public StringBuilder Builder { get; } = new();
 
@@ -150,12 +151,11 @@ public class GrammarGenerator(BinaryData YamlSpec, ILoggerFactory? loggerFactory
     {
         Builder.Clear();
         cancellationToken.ThrowIfCancellationRequested();
-        var yaml = new YamlStream();
-        yaml.Load(new StreamReader(YamlSpec.ToStream()));
+        var yaml = ParseYamlStream(new(YamlSpec.ToMemory()));
         var yamlSpecDocument = yaml.Documents.Single();
-        var ruleNodes = (YamlMappingNode)yamlSpecDocument.RootNode;
-        var namesIndex = ruleNodes.Where(x => x.Key.ToString()[0] == ':')
-            .ToDictionary(x => x.Value.ToString(), x => x.Key.ToString()[1..]);
+        var root = (YamlMappingNode)yamlSpecDocument.RootNode!;
+        NamesIndex = root.Children.Where(x => x.Key!.ToString()[0] == ':')
+            .ToDictionary(x => x.Value!.ToString(), x => x.Key!.ToString()[1..]);
 
         Logger.LogDebug($"Generating grammar for rule YAML spec rule {rule}.");
         // prefix
@@ -173,9 +173,9 @@ public class GrammarGenerator(BinaryData YamlSpec, ILoggerFactory? loggerFactory
                 public YamlParseResult Top() => {{SafeRuleName(rule)}}();
             """);
 
-        foreach (var (ruleName, ruleIndex) in namesIndex)
+        foreach (var (ruleName, ruleIndex) in NamesIndex)
         {
-            var ruleNode = ruleNodes[ruleName];
+            var ruleNode = root.Children.First(x => x.Key!.ToString() == ruleName).Value!;
             CreateRuleMethod(ruleName, ruleIndex, ruleNode);
         }
         // suffix
@@ -209,7 +209,10 @@ public class GrammarGenerator(BinaryData YamlSpec, ILoggerFactory? loggerFactory
     JsonSerializerOptions PrettyJsonOptions { get; } = new JsonSerializerOptions
     {
         WriteIndented = true,
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
+
+    bool IsRule(string name) => NamesIndex.ContainsKey(name);
 
     void CreateRuleMethod(string ruleName, string ruleIndex, YamlNode ruleNode)
     {
@@ -226,48 +229,48 @@ public class GrammarGenerator(BinaryData YamlSpec, ILoggerFactory? loggerFactory
             """);
     }
 
-    IEnumerable<GrammarExpressionBase> ParseGrammarExpression(YamlNode node)
+    IEnumerable<GrammarExpressionBase> ParseGrammarExpression(YamlNode? node) => node switch
     {
-        return node switch
-        {
-            YamlScalarNode scalarNode => [ParseScalarExpression(scalarNode)],
-            YamlSequenceNode sequenceNode => ParseSequenceExpression(sequenceNode),
-            YamlMappingNode mappingNode => ParseMappingExpression(mappingNode),
-            _ => throw new NotSupportedException($"Rule node type {node.GetType()} is not supported."),
-        };
-    }
+        YamlScalarNode scalarNode => [ParseScalarExpression(scalarNode)],
+        YamlSequenceNode sequenceNode => ParseSequenceExpression(sequenceNode),
+        YamlMappingNode mappingNode => ParseMappingExpression(mappingNode),
+        _ => throw new NotSupportedException($"Rule node {node?.GetType().Name ?? "null"} is not supported."),
+    };
 
-    GrammarExpressionBase ParseScalarExpression(YamlScalarNode node)
+    GrammarExpressionBase ParseScalarExpression(YamlScalarNode node) => node switch
     {
-        return node switch
-        {
-            { Style: ScalarStyle.DoubleQuoted, Value: { } value } => new LiteralStringExpression(value),
-            { Style: ScalarStyle.SingleQuoted, Value: { } value } => new LiteralCharacterExpression(value),
-            { Style: ScalarStyle.Plain, Value: [_] value } => new LiteralCharacterExpression(value),
-            { Style: ScalarStyle.Plain, Value: ['x', _, ..] value } => new LiteralCharacterExpression(value),
-            { Style: ScalarStyle.Plain, Value: ['(', _, ..] value } => new ParsingFunctionExpression(value),
-            { Style: ScalarStyle.Plain, Value: ['<', _, ..] value } => new LiteralCharacterExpression(value),
-            { Style: ScalarStyle.Plain, Value: { } value } => new RuleNameExpression(value),
-            _ => throw new NotSupportedException($"Rule scalar (style={node?.Style}) is not supported. Value: '{node?.Value}'."),
-        };
-    }
+        { Value: [_] value } => new LiteralCharacterExpression(value),
+        { Value: ['x', _, ..] value } => new LiteralCharacterExpression(value),
+        { Value: ['(', _, ..] value } => new ParsingFunctionExpression(value),
+        { Value: ['<', _, ..] value } => new LiteralCharacterExpression(value),
+        { Value: { } value } when IsRule(value) => new RuleNameExpression(value),
+        { Value: { } value } => new LiteralStringExpression(value),
+        _ => throw new NotSupportedException($"Rule scalar is not supported. Value: '{node?.Value}'."),
+    };
 
     IEnumerable<GrammarExpressionBase> ParseSequenceExpression(YamlSequenceNode node)
     {
         foreach (var item in node.Children)
         {
-            var result = ParseGrammarExpression(item).ToList();
-            if (result.Count == 1)
+            if (item is YamlSequenceNode seq)
             {
-                yield return result[0];
-            }
-            else if (result is [LiteralCharacterExpression first, LiteralCharacterExpression last])
-            {
-                yield return new LiteralRangeExpression(first.Value, last.Value);
+                var result = ParseSequenceExpression(seq).ToList();
+                if (result is [LiteralCharacterExpression first, LiteralCharacterExpression last])
+                {
+                    yield return new LiteralRangeExpression(first.Value, last.Value);
+                }
+                else
+                {
+                    throw new NotSupportedException($"Rule sequence with {result.Count} elements is not supported.");
+                }
             }
             else
             {
-                throw new NotSupportedException($"Rule sequence with {result.Count} elements is not supported.");
+                var childExpressions = ParseGrammarExpression(item);
+                foreach (var child in childExpressions)
+                {
+                    yield return child;
+                }
             }
         }
     }
@@ -290,44 +293,158 @@ public class GrammarGenerator(BinaryData YamlSpec, ILoggerFactory? loggerFactory
         }
     }
 
-    abstract record GrammarExpressionBase(GrammarExpressionType Type)
+    [JsonPolymorphic]
+    [JsonDerivedType(typeof(RuleDefinitionExpression), "ruleDef")]
+    [JsonDerivedType(typeof(RuleNameExpression), "rule")]
+    [JsonDerivedType(typeof(VariableExpression), "var")]
+    [JsonDerivedType(typeof(LiteralCharacterExpression), "char")]
+    [JsonDerivedType(typeof(LiteralRangeExpression), "range")]
+    [JsonDerivedType(typeof(LiteralStringExpression), "literal")]
+    [JsonDerivedType(typeof(ParsingFunctionExpression), "fun")]
+    [JsonDerivedType(typeof(SpecialRuleExpression), "assert")]
+    abstract record GrammarExpressionBase
     {
         public ImmutableArray<GrammarExpressionBase> Expressions { get; init; } = [];
     }
 
-    record RuleDefinitionExpression(string Name) : GrammarExpressionBase(GrammarExpressionType.Rule);
+    /// <summary>Definition of a grammar rule.</summary>
+    record RuleDefinitionExpression(string Name) : GrammarExpressionBase;
 
-    record RuleNameExpression(string Name) : GrammarExpressionBase(GrammarExpressionType.RuleName);
+    /// <summary>Name of a grammar rule.</summary>
+    record RuleNameExpression(string Name) : GrammarExpressionBase;
 
-    record VariableExpression(string Name) : GrammarExpressionBase(GrammarExpressionType.Variable);
+    /// <summary>Single-character name of grammar variable.</summary>
+    record VariableExpression(string Name) : GrammarExpressionBase;
 
-    record LiteralCharacterExpression(string Value) : GrammarExpressionBase(GrammarExpressionType.LiteralCharacter);
+    /// <summary>Single-character literal, including hex-code character.</summary>
+    record LiteralCharacterExpression(string Value) : GrammarExpressionBase;
 
-    record LiteralRangeExpression(string Start, string End) : GrammarExpressionBase(GrammarExpressionType.LiteralRange);
+    /// <summary>Range of literals, as a pair of character literals.</summary>
+    record LiteralRangeExpression(string Start, string End) : GrammarExpressionBase;
 
-    record LiteralStringExpression(string Value) : GrammarExpressionBase(GrammarExpressionType.LiteralString);
+    /// <summary>Multi-character literal.</summary>
+    record LiteralStringExpression(string Value) : GrammarExpressionBase;
 
-    record ParsingFunctionExpression(string Name) : GrammarExpressionBase(GrammarExpressionType.ParsingFunction);
+    /// <summary>Parsing function name (with parentheses).</summary>
+    record ParsingFunctionExpression(string Name) : GrammarExpressionBase;
 
-    record SpecialRuleExpression(string Name) : GrammarExpressionBase(GrammarExpressionType.SpecialRule);
+    /// <summary>Special rule name (with angle brackets).</summary>
+    record SpecialRuleExpression(string Name) : GrammarExpressionBase;
 
-    enum GrammarExpressionType
+    // -------------------------------------
+    // VYaml Node parser
+    // -------------------------------------
+
+    static YamlStream ParseYamlStream(in ReadOnlySequence<byte> utf8yaml)
     {
-        /// <summary>Definition of a grammar rule.</summary>
-        Rule,
-        /// <summary>Name of a grammar rule.</summary>
-        RuleName,
-        /// <summary>Single-character name of grammar variable.</summary>
-        Variable,
-        /// <summary>Single-character literal, including hex-code character.</summary>
-        LiteralCharacter,
-        /// <summary>Range of literals, as a pair of character literals.</summary>
-        LiteralRange,
-        /// <summary>Multi-character literal.</summary>
-        LiteralString,
-        /// <summary>Parsing function name (with parentheses).</summary>
-        ParsingFunction,
-        /// <summary>Special rule name (with angle brackets).</summary>
-        SpecialRule,
+        var parser = VYaml.Parser.YamlParser.FromSequence(utf8yaml);
+        var stream = new YamlStream([]);
+        var document = default(YamlDocument);
+        var nodeStack = ImmutableStack<YamlNode>.Empty;
+        while (!parser.End && parser.Read())
+        {
+            VYaml.Parser.ParseEventType eventType = parser.CurrentEventType;
+            switch (eventType)
+            {
+                case VYaml.Parser.ParseEventType.StreamStart:
+                    Debug.Assert(document is null);
+                    Debug.Assert(nodeStack.IsEmpty);
+                    break;
+                case VYaml.Parser.ParseEventType.StreamEnd:
+                    Debug.Assert(document is null);
+                    Debug.Assert(nodeStack.IsEmpty);
+                    break;
+                case VYaml.Parser.ParseEventType.DocumentStart:
+                    Debug.Assert(document is null);
+                    document = new YamlDocument(null);
+                    Debug.Assert(nodeStack.IsEmpty);
+                    break;
+                case VYaml.Parser.ParseEventType.DocumentEnd:
+                    {
+                        var rootNode = default(YamlNode);
+                        nodeStack = nodeStack.IsEmpty ? nodeStack : nodeStack.Pop(out rootNode);
+                        if (!nodeStack.IsEmpty)
+                        {
+                            throw new InvalidOperationException($"Node stack is not empty at the end of document, parser at {parser.CurrentMark}.");
+                        }
+                        if (document is null)
+                        {
+                            throw new InvalidOperationException($"Document end event without start, parser at {parser.CurrentMark}.");
+                        }
+                        stream = stream with { Documents = [.. stream.Documents, document with { RootNode = rootNode }] };
+                        document = default;
+                        break;
+                    }
+                case VYaml.Parser.ParseEventType.Alias:
+                    // ignoring, spec doesn't use tags/anchors/aliases
+                    break;
+                case VYaml.Parser.ParseEventType.Scalar:
+                    {
+                        var node = new YamlScalarNode(parser.GetScalarAsString());
+                        nodeStack = WithNode(nodeStack, node, ref parser);
+                        break;
+                    }
+                case VYaml.Parser.ParseEventType.SequenceStart:
+                    nodeStack = nodeStack.Push(new YamlSequenceNode([]));
+                    break;
+                case VYaml.Parser.ParseEventType.SequenceEnd:
+                    {
+                        nodeStack = nodeStack.Pop(out var node);
+                        Debug.Assert(node is YamlSequenceNode);
+                        nodeStack = WithNode(nodeStack, node, ref parser);
+                        break;
+                    }
+                case VYaml.Parser.ParseEventType.MappingStart:
+                    nodeStack = nodeStack.Push(new YamlMappingNode([]));
+                    break;
+                case VYaml.Parser.ParseEventType.MappingEnd:
+                    {
+                        nodeStack = nodeStack.Pop(out var node);
+                        Debug.Assert(node is YamlMappingNode);
+                        nodeStack = WithNode(nodeStack, node, ref parser);
+                        break;
+                    }
+                default:
+                    throw new InvalidOperationException($"Unknown event type {eventType}.");
+            }
+        }
+        return stream;
+
+        static ImmutableStack<YamlNode> WithNode(
+            ImmutableStack<YamlNode> stack,
+            YamlNode node,
+            ref VYaml.Parser.YamlParser parser) => stack switch
+            {
+                null => throw new ArgumentNullException(nameof(stack), $"Stack is null, parser at mark: {parser.CurrentMark}"),
+                { IsEmpty: true } =>
+                    stack.Push(node),
+                { } when stack.Peek() is YamlSequenceNode seq =>
+                    stack.Pop().Push(seq with { Children = seq.Children.Add(node) }),
+                { } when stack.Peek() is YamlMappingNode =>
+                    stack.Push(node),
+                { } when stack.Pop(out var prevNode) is { IsEmpty: false } prevStack && prevStack.Peek() is YamlMappingNode map =>
+                    prevStack.Pop().Push(map with { Children = map.Children.Add(new YamlMappingPair(prevNode, node)) }),
+                _ => throw new InvalidOperationException($"Unexpected stack state at {parser.CurrentMark}: '{string.Join(", ", stack.Select(x => x.ToString()))}'."),
+            };
     }
+
+    record YamlStream(ImmutableArray<YamlDocument> Documents);
+
+    record YamlDocument(YamlNode? RootNode);
+
+    abstract record YamlNode();
+
+    record YamlScalarNode(string? Value) : YamlNode
+    {
+        public override string ToString()
+        {
+            return Value ?? "";
+        }
+    }
+
+    record YamlSequenceNode(ImmutableArray<YamlNode> Children) : YamlNode;
+
+    record YamlMappingNode(ImmutableArray<YamlMappingPair> Children) : YamlNode;
+
+    record YamlMappingPair(YamlNode? Key, YamlNode? Value) : YamlNode;
 }
