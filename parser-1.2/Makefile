@@ -1,29 +1,29 @@
-SHELL := bash
+M := ../.cache/makes
+$(shell [ -d $M ] || git clone -q https://github.com/makeplus/makes $M)
+include $M/init.mk
 
 ROOT := $(shell cd ..; pwd)
 
 ALL := \
-    coffeescript \
-    javascript \
-    perl \
+  coffeescript \
+  javascript \
+  perl \
 
-ALL_BUILD := $(ALL:%=build-%)
-ALL_TEST := $(ALL:%=test-%)
-ALL_CLEAN := $(ALL:%=clean-%)
+ALL-BUILD := $(ALL:%=build-%)
+ALL-TEST := $(ALL:%=test-%)
+ALL-CLEAN := $(ALL:%=clean-%)
 
-default:
-
-build: $(ALL_BUILD)
+build: $(ALL-BUILD)
 
 build-%:
 	$(MAKE) -C $(@:build-%=%) build
 
-test: $(ALL_TEST)
+test: $(ALL-TEST)
 
 test-%:
 	$(MAKE) -C $(@:test-%=%) test TRACE=$(TRACE) DEBUG=$(DEBUG)
 
-clean: $(ALL_CLEAN)
+clean: $(ALL-CLEAN)
 	$(MAKE) -C $(ROOT)/test $@
 
 clean-%:

@@ -3,71 +3,71 @@ SHELL := bash
 .PHONY: test
 
 ifeq (,$(ROOT))
-    $(error ROOT not defined)
+  $(error ROOT not defined)
 endif
 ifeq (,$(BASE))
-    $(error BASE not defined)
+  $(error BASE not defined)
 endif
 BASE12 := $(ROOT)/parser-1.2
 
-LOCAL_MAKE := $(ROOT)/.git/local.mk
-ifneq (,$(wildcard $(LOCAL_MAKE)))
-    $(info ***** USING LOCAL MAKEFILE OVERRIDES *****)
-    $(info ***** $(LOCAL_MAKE))
-    include $(LOCAL_MAKE)
+LOCAL-MAKE := $(ROOT)/.git/local.mk
+ifneq (,$(wildcard $(LOCAL-MAKE)))
+  $(info ***** USING LOCAL MAKEFILE OVERRIDES *****)
+  $(info ***** $(LOCAL-MAKE))
+  include $(LOCAL-MAKE)
 endif
 
-SPEC_PATCHED_YAML := $(BASE)/build/yaml-spec-1.2-patched.yaml
-SPEC_YAML := $(BASE)/build/yaml-spec-1.2.yaml
-SPEC_PATCH := $(BASE)/build/yaml-spec-1.2.patch
+SPEC-PATCHED-YAML := $(BASE)/build/yaml-spec-1.2-patched.yaml
+SPEC-YAML := $(BASE)/build/yaml-spec-1.2.yaml
+SPEC-PATCH := $(BASE)/build/yaml-spec-1.2.patch
 GENERATOR := $(BASE)/build/bin/generate-yaml-grammar
-GENERATOR_LIB := $(BASE)/build/lib/generate-yaml-grammar.coffee
-GENERATOR_LANG_LIB := $(BASE)/build/lib/generate-yaml-grammar-$(PARSER_LANG).coffee
-NODE_MODULES := $(ROOT)/node_modules
+GENERATOR-LIB := $(BASE)/build/lib/generate-yaml-grammar.coffee
+GENERATOR-LANG-LIB := $(BASE)/build/lib/generate-yaml-grammar-$(PARSER-LANG).coffee
+NODE-MODULES := $(ROOT)/node_modules
 
 TESTML_REPO ?= https://github.com/testml-lang/testml
 TESTML_COMMIT ?= master
-YAML_TEST_SUITE_REPO ?= https://github.com/yaml/yaml-test-suite
-YAML_TEST_SUITE_COMMIT ?= main
+YAML-TEST-SUITE-REPO ?= https://github.com/yaml/yaml-test-suite
+YAML-TEST-SUITE-COMMIT ?= main
 
-PATH := $(NODE_MODULES)/.bin:$(PATH)
-PATH := $(ROOT)/test/testml/bin:$(PATH)
+override PATH := $(NODE-MODULES)/.bin:$(PATH)
+override PATH := $(ROOT)/test/testml/bin:$(PATH)
 export PATH
 
 export TESTML_RUN := $(BIN)-tap
 export TESTML_LIB := $(ROOT)/test:$(ROOT)/test/suite/test:$(TESTML_LIB)
 
-BUILD_DEPS ?= $(NODE_MODULES)
-TEST_DEPS ?= \
-    $(ROOT)/test/testml \
-    $(ROOT)/test/suite \
+BUILD-DEPS ?= $(NODE-MODULES)
+TEST-DEPS ?= \
+  $(ROOT)/test/testml \
+  $(ROOT)/test/suite \
 
 test := test/*.tml
 
 .DELETE_ON_ERROR:
 
-default:
+default::
 
-build:: $(BUILD_DEPS) $(GRAMMAR)
+build:: $(BUILD-DEPS) $(GRAMMAR)
 
-test:: build $(TEST_DEPS)
+test:: build $(TEST-DEPS)
 	TRACE=$(TRACE) TRACE_QUIET=$(TRACE_QUIET) DEBUG=$(DEBUG) \
-	    prove -v $(test)
+	  prove -v $(test)
 
 clean::
 
-$(GRAMMAR): $(SPEC_PATCHED_YAML) $(GENERATOR) $(GENERATOR_LIB) $(GENERATOR_LANG_LIB)
+$(GRAMMAR): $(SPEC-PATCHED-YAML) $(GENERATOR) $(GENERATOR-LIB) $(GENERATOR-LANG-LIB)
 	$(GENERATOR) \
-	    --from=$< \
-	    --to=$(PARSER_LANG) \
-	    --rule=l-yaml-stream \
+	  --from=$< \
+	  --to=$(PARSER-LANG) \
+	  --rule=l-yaml-stream \
 	> $@
 
-$(SPEC_PATCHED_YAML): $(SPEC_YAML)
+$(SPEC-PATCHED-YAML): $(SPEC-YAML)
 	cp $< $@
-	patch $@ < $(SPEC_PATCH)
+	patch $@ < $(SPEC-PATCH)
 
-$(SPEC_YAML):
+$(SPEC-YAML):
 	cp $(ROOT)/../yaml-grammar/yaml-spec-1.2.yaml $@ || \
 	wget https://raw.githubusercontent.com/yaml/yaml-grammar/master/yaml-spec-1.2.yaml || \
 	curl -O https://raw.githubusercontent.com/yaml/yaml-grammar/master/yaml-spec-1.2.yaml
@@ -77,7 +77,7 @@ $(ROOT)/test/testml: $(ROOT)/test $(BASE12)/perl/ext-perl
 	$(eval override export PERL5LIB := $(BASE12)/perl/ext-perl/lib/perl5:$(PERL5LIB))
 	$(MAKE) -C $< all
 
-$(NODE_MODULES):
+$(NODE-MODULES): $(NODE)
 	$(MAKE) -C $(ROOT) $(@:$(ROOT)/%=%)
 
 $(BASE12)/perl/ext-perl:

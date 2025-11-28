@@ -1,6 +1,6 @@
 ROOT := $(shell cd ../..; pwd)
 BASE := $(ROOT)/parser-1.3
-PARSER_LANG := coffeescript
+PARSER-LANG := coffeescript
 BIN := coffee
 GRAMMAR :=
 

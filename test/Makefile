@@ -4,8 +4,8 @@ BASE := $(ROOT)/test
 include $(ROOT)/.common.mk
 
 ALL := \
-    testml \
-    yaml-test-suite.tml \
+  testml \
+  yaml-test-suite.tml \
 
 all: $(ALL)
 
@@ -29,6 +29,6 @@ yaml-test-suite.tml: suite
 	done > $@
 
 suite:
-	$(call git-clone,$@,$(YAML_TEST_SUITE_REPO),$(YAML_TEST_SUITE_COMMIT))
+	$(call git-clone,$@,$(YAML-TEST-SUITE-REPO),$(YAML-TEST-SUITE-COMMIT))
 	$(MAKE) -C $@ testml
 	ln -s testml $@/test

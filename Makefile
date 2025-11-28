@@ -1,32 +1,29 @@
-SHELL := bash
+M := .cache/makes
+$(shell [ -d $M ] || git clone -q https://github.com/makeplus/makes $M)
+include $M/init.mk
+include $M/node.mk
+include $M/clean.mk
 
-ROOT := $(shell pwd)
-
-PARSER_1_3 := parser-1.3
-PARSER_1_2 := parser-1.2
+MAKES-CLEAN := node_modules
 
 ALL := \
-    $(PARSER_1_3) \
-    $(PARSER_1_2) \
+  parser-1.2 \
+  parser-1.3 \
 
-ALL_TEST := $(ALL:parser-%=test-%)
-ALL_CLEAN := $(ALL:parser-%=clean-%)
+ALL-TEST := $(ALL:parser-%=test-%)
+ALL-CLEAN := $(ALL:parser-%=clean-%)
 
-default:
-	@echo $(ALL_TEST)
 
-test: test-1.3
+test: test-1.2
 
-test-all: $(ALL_TEST)
+test-all: $(ALL-TEST)
 
-$(ALL_TEST):
+$(ALL-TEST):
 	$(MAKE) -C $(@:test-%=parser-%) test TRACE=$(TRACE) DEBUG=$(DEBUG)
 
-clean: $(ALL_CLEAN)
-	rm -fr node_modules
-
-$(ALL_CLEAN):
-	$(MAKE) -C $(@:clean-%=parser-%) clean
+clean::
+	$(MAKE) -C parser-1.2 clean
+	$(MAKE) -C parser-1.3 clean
 
 node_modules:
 	git branch --track $@ origin/$@ 2>/dev/null || true

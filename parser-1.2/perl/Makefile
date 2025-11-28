@@ -1,14 +1,13 @@
 ROOT := $(shell cd ../..; pwd)
 BASE := $(ROOT)/parser-1.2
-PARSER_LANG := perl
+PARSER-LANG := perl
 BIN := perl
 GRAMMAR := lib/Grammar.pm
 
-TEST_DEPS := \
-    $(ROOT)/test/testml \
-    $(ROOT)/test/suite \
-    ext-perl \
-
+TEST-DEPS := \
+  $(ROOT)/test/testml \
+  $(ROOT)/test/suite \
+  ext-perl \
 
 include $(ROOT)/.common.mk
 

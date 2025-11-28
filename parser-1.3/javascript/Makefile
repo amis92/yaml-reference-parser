@@ -1,22 +1,22 @@
 ROOT := $(shell cd ../..; pwd)
 BASE := $(ROOT)/parser-1.3
-PARSER_LANG := javascript
+PARSER-LANG := javascript
 BIN := node
 GRAMMAR :=
 
-ALL_JS := \
-    bin/yaml-parser \
-    lib/grammar.js \
-    lib/parser.js \
-    lib/prelude.js \
-    lib/receiver.js \
-    lib/test-receiver.js \
-    test/testml-bridge.js \
+ALL-JS := \
+  bin/yaml-parser \
+  lib/grammar.js \
+  lib/parser.js \
+  lib/prelude.js \
+  lib/receiver.js \
+  lib/test-receiver.js \
+  test/testml-bridge.js \
 
-BUILD_DEPS := \
-    $(ROOT)/node_modules \
-    $(ALL_JS) \
-    $(ROOT)/test/testml/src/node/lib \
+BUILD-DEPS := \
+  $(ROOT)/node_modules \
+  $(ALL-JS) \
+  $(ROOT)/test/testml/src/node/lib \
 
 
 include $(ROOT)/.common.mk
