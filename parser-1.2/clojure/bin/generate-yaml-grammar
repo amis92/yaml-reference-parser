@@ -1,0 +1,446 @@
+#!/usr/bin/env bb
+
+;; YAML Grammar Generator for Clojure
+;; Reads the YAML spec YAML file and generates grammar.clj
+
+(ns generate-yaml-grammar
+  (:require [clj-yaml.core :as yaml]
+            [clojure.string :as str]
+            [babashka.cli :as cli]))
+
+;; State
+(def ^:dynamic *num* 0)
+(def ^:dynamic *arg* false)
+(def ^:dynamic *group* false)
+(def ^:dynamic *args* [])
+(def ^:dynamic *setm* "")
+(def ^:dynamic *rep-count* (atom 0))  ; Track rep count for rep/rep2 naming
+
+;; Helper functions
+(defn rule-name [name]
+  (str/replace name #"[-+]" "_"))
+
+(defn indent [text & [n]]
+  (let [n (or n 1)
+        prefix (apply str (repeat (* 2 n) " "))]
+    (str/replace text #"(?m)^(.)" (str prefix "$1"))))
+
+(defn string-val [o]
+  (if (nil? o) "nil" (str o)))
+
+;; Get comments from spec - simpler approach using reduce
+(defn get-comments [spec-text]
+  (let [lines (str/split-lines spec-text)]
+    (first
+     (reduce
+      (fn [[comments current-num current-comment] line]
+        (cond
+          ;; Found a new rule number
+          (re-matches #"^:(\d+):.*" line)
+          (let [[_ num] (re-matches #"^:(\d+):.*" line)]
+            [(if current-num
+               (assoc comments current-num current-comment)
+               comments)
+             num
+             (str ";; [" num "]\n")])
+
+          ;; Comment line for current rule
+          (and current-num (str/starts-with? line "# "))
+          (let [comment-text (-> (subs line 2)
+                                 (str/replace "\\" "\\\\"))]  ; Escape backslashes in comments
+            [comments current-num (str current-comment ";; " comment-text "\n")])
+
+          ;; Other line - finalize current rule if any
+          current-num
+          [(assoc comments current-num current-comment) nil nil]
+
+          ;; No current rule
+          :else
+          [comments nil nil]))
+      [{} nil nil]
+      lines))))
+
+;; Build nums map (rule name -> :NNN key)
+(defn build-nums [spec]
+  (reduce (fn [acc [k v]]
+            (if (str/starts-with? (name k) ":")
+              (assoc acc v k)
+              acc))
+          {}
+          spec))
+
+;; Code generation functions
+(defn gen-hex-code [hex]
+  (let [code-point (Long/parseLong hex 16)]
+    (if (> code-point 0xFFFF)
+      ;; For code points above 0xFFFF, use String constructor from code points
+      (str "(String. (int-array [0x" hex "]) 0 1)")
+      ;; For 4-digit or less, use \uXXXX escape
+      (let [padded (if (< (count hex) 4)
+                     (str (apply str (repeat (- 4 (count hex)) "0")) hex)
+                     hex)]
+        (str "\"\\u" padded "\"")))))
+
+(defn gen-null [] "nil")
+
+(defn gen-pair-sep [] " ")
+
+(defn gen-method-call-args [args]
+  (let [multiline (or *group*
+                      (some #(and (string? %) (str/includes? % "\n")) args))]
+    (if multiline
+      [(str/join ",\n" (map #(indent (string-val %)) args)) "\n"]
+      [(str/join ", " (map string-val args)) ""])))
+
+(defn gen-method-call [method & args]
+  (let [[args-str sep] (gen-method-call-args args)]
+    (str "(p/" method " parser" (when (seq args-str) (str sep " " args-str)) (when (= sep "\n") "\n") ")")))
+
+(defn gen-method-ref [name]
+  (cond
+    (= name "auto_detect_indent")
+    (str "[" name ", n]")
+
+    ;; Special parser-level functions (not grammar rules)
+    (contains? #{"start_of_line" "end_of_stream"} name)
+    (str "(p/" (str/replace name "_" "-") " parser)")
+
+    :else
+    name))
+
+(defn gen-var-value [var-name]
+  var-name)
+
+(defn gen-limit [n]
+  (cond
+    (number? n) n
+    (nil? n) "nil"
+    :else n))
+
+(declare gen gen-arg gen-set)
+
+;; Rule generation
+(defn gen-group [items kind]
+  ;; Reset rep count when entering a group
+  (binding [*group* true
+            *rep-count* (atom 0)]
+    (let [generated (mapv gen items)]
+      (apply gen-method-call kind generated))))
+
+(defn gen-rep [rule min max]
+  ;; Track rep count - first rep is "rep", subsequent ones are "rep2"
+  (let [rep-num (swap! *rep-count* inc)
+        rep-fn (if (> rep-num 1) "rep2" "rep")]
+    (-> (gen-method-call rep-fn (gen-limit min) (gen-limit max) (gen rule))
+        (str/replace #"\(\n  (-?\d+),\n  (nil|-?\d+)," "($1, $2,")
+        (str/replace #"\)\n\)" "))"))))
+
+(defn gen-call [call args]
+  (let [args (if (sequential? args) args [args])
+        list-str (str/join ", " (map gen-arg args))
+        ref (gen-method-ref (rule-name call))]
+    (str "[" ref ", " list-str "]")))
+
+(defn gen-may [rule]
+  (gen-method-call "may" (gen rule)))
+
+(defn gen-chk [rule kind]
+  (gen-method-call "chk" (str "\"" kind "\"") (gen rule)))
+
+(defn gen-hash [obj]
+  (str "{"
+       (str/join ""
+                 (for [[k v] obj]
+                   (let [rule (-> (gen v)
+                                  (str/replace #"\s+" " ")
+                                  (str/replace #",\ \)" " )"))
+                         ;; Convert keyword to string key (remove leading :)
+                         key-str (if (keyword? k) (name k) (str k))]
+                     (str "\n  \"" key-str "\"" (gen-pair-sep) rule ","))))
+       "\n}"))
+
+(defn gen-case [obj]
+  (let [var-name (:var obj)
+        obj (dissoc obj :var)]
+    (gen-method-call "case*" (gen-var-value var-name) (gen-hash obj))))
+
+(defn gen-flip [obj]
+  (let [var-name (:var obj)
+        obj (dissoc obj :var)
+        hash-str (str "{"
+                      (str/join ""
+                                (for [[k v] obj]
+                                  (let [key-str (if (keyword? k) (name k) (str k))]
+                                    (str "\n  \"" key-str "\"" (gen-pair-sep) (gen-arg v) ","))))
+                      "\n}")]
+    (gen-method-call "flip" (gen-var-value var-name) hash-str)))
+
+(defn gen-max [max-val]
+  (gen-method-call "max*" max-val))
+
+(defn gen-if [cond-expr set-expr]
+  (gen-method-call "if*" (gen cond-expr) (gen-set set-expr)))
+
+(defn gen-set [[vari expr]]
+  (gen-method-call "set*" (str "\"" vari "\"") (gen expr)))
+
+(defn gen-ord [expr]
+  (gen-method-call "ord" (gen expr)))
+
+(defn gen-len [expr]
+  (gen-method-call "len" (gen expr)))
+
+(defn gen-exclude [rule]
+  (gen-method-call "exclude" (gen rule)))
+
+(defn gen-add [[x y]]
+  (gen-method-call "add" (gen x) (gen y)))
+
+(defn gen-sub [[x y]]
+  (gen-method-call "sub" (gen x) (gen y)))
+
+(defn gen-lt [[x y]]
+  (gen-method-call "lt" (gen-arg x) (gen-arg y)))
+
+(defn gen-le [[x y]]
+  (gen-method-call "le" (gen-arg x) (gen-arg y)))
+
+(defn gen-arg [arg]
+  (binding [*arg* true]
+    (gen arg)))
+
+(defn gen-from-string [rule]
+  (cond
+    ;; Hex character: x0A -> (p/chr parser "\u000A")
+    (re-matches #"^x([0-9A-F]+)$" rule)
+    (let [[_ hex] (re-matches #"^x([0-9A-F]+)$" rule)]
+      (gen-method-call "chr" (gen-hex-code hex)))
+
+    ;; Rule reference: b-char, ns-plain, etc.
+    (re-matches #"^(?:b|c|e|l|nb|ns|s)(?:[-+][a-z0-9]+)+$" rule)
+    (gen-method-ref (rule-name rule))
+
+    ;; Single character
+    (= (count rule) 1)
+    (cond
+      (= rule "'") (gen-method-call "chr" "\"'\"")
+      (= rule "\\") (gen-method-call "chr" "\"\\\\\"")
+      (= rule "\"") (gen-method-call "chr" "\"\\\"\"")
+      (= rule "{") (gen-method-call "chr" "\"\\u007B\"")
+      (= rule "}") (gen-method-call "chr" "\"\\u007D\"")
+      (= rule "#") (gen-method-call "chr" "\"\\u0023\"")
+      (= rule "@") (gen-method-call "chr" "\"\\u0040\"")
+      (= rule "`") (gen-method-call "chr" "\"\\u0060\"")
+      *arg* (if (and (contains? #{"m" "t"} rule)
+                     (not (contains? (set *args*) rule))
+                     (empty? *setm*))
+              (gen-method-call rule)
+              (gen-var-value rule))
+      :else (gen-method-call "chr" (str "\"" rule "\"")))
+
+    ;; Context values
+    (or (re-matches #"^(flow|block)-(in|out|key)$" rule)
+        (contains? #{"auto-detect" "strip" "clip" "keep"} rule))
+    (str "\"" rule "\"")
+
+    ;; Rule reference in angle brackets: <rule>
+    (re-matches #"^<(\w.+)>$" rule)
+    (let [[_ name] (re-matches #"^<(\w.+)>$" rule)]
+      (gen-method-ref (rule-name name)))
+
+    ;; Match reference
+    (= rule "(match)")
+    "(p/match parser)"
+
+    :else
+    (throw (ex-info (str "[" *num* "] Unknown string rule type") {:rule rule}))))
+
+(defn gen-from-array [rule]
+  (if (and (= (count rule) 2)
+           (string? (first rule))
+           (str/starts-with? (first rule) "x"))
+    ;; Range: [x20, x7E]
+    (let [[x y] rule]
+      (gen-method-call "rng" (gen-hex-code (subs x 1)) (gen-hex-code (subs y 1))))
+    (throw (ex-info (str "[" *num* "] Unknown array rule type") {:rule rule}))))
+
+(defn gen-from-hash [rule]
+  (let [set-expr (get rule (keyword "(set)"))
+        keys (keys rule)]
+    (when (and (> (count keys) 1) (nil? set-expr))
+      (when-not (or (get rule (keyword "(...)"))
+                    (get rule (keyword "(->m)"))
+                    (get rule (keyword "(m>0)")))
+        (throw (ex-info (str "[" *num* "] unknown keys") {:keys keys}))))
+
+    (let [key (first keys)
+          key-str (name key)
+          val (get rule key)]
+      (cond
+        ;; Fixed repetition: ({X})
+        (re-matches #"^\(\{(.)\}\)$" key-str)
+        (let [[_ n] (re-matches #"^\(\{(.)\}\)$" key-str)]
+          (gen-rep val n n))
+
+        ;; Rule call with args
+        (re-matches #"^(([bcls]|n[bs]|in|seq)[-+][-+a-z0-9]+)$" key-str)
+        (gen-call key-str val)
+
+        (= key-str "auto-detect")
+        (gen-call key-str val)
+
+        ;; Operators
+        (= key-str "(any)") (gen-group val "any")
+        (= key-str "(all)") (gen-group val "all")
+        (= key-str "(---)") (gen-group val "but")
+
+        (= key-str "(+++)") (gen-rep val 1 nil)
+        (= key-str "(***)") (gen-rep val 0 nil)
+        (= key-str "(???)") (gen-rep val 0 1)
+
+        (= key-str "(<<<)") (gen-may val)
+        (= key-str "(===)") (gen-chk val "=")
+        (= key-str "(!==)") (gen-chk val "!")
+        (= key-str "(<==)") (gen-chk val "<=")
+
+        (= key-str "(+)") (gen-add val)
+        (= key-str "(-)") (gen-sub val)
+        (= key-str "(<)") (gen-lt val)
+        (= key-str "(<=)") (gen-le val)
+
+        (= key-str "(case)") (gen-case val)
+        (= key-str "(flip)") (gen-flip val)
+        (= key-str "(max)") (gen-max val)
+        (= key-str "(if)") (gen-if val set-expr)
+        (= key-str "(set)") (gen-set val)
+        (= key-str "(ord)") (gen-ord val)
+        (= key-str "(len)") (gen-len val)
+        (= key-str "(exclude)") (gen-exclude val)
+
+        :else
+        (throw (ex-info (str "[" *num* "] unknown hash rule") {:rule rule :key key-str}))))))
+
+(defn gen [rule]
+  (cond
+    (map? rule) (gen-from-hash rule)
+    (sequential? rule) (gen-from-array rule)
+    (string? rule) (gen-from-string rule)
+    (number? rule) (str rule)
+    (nil? rule) (gen-null)
+    :else (throw (ex-info (str "[" *num* "] unknown rule type") {:rule rule}))))
+
+(defn gen-setm [return-false]
+  (if return-false
+    "\n  (if-let [m (p/call parser [auto_detect_indent, n] \"number\")]\n    (do"
+    "\n  (let [m (p/call parser [auto_detect_indent, n] \"number\")]"))
+
+(defn gen-rule-args [spec name]
+  (let [rule (get spec (keyword name))]
+    (if-not (map? rule)
+      "[parser]"
+      (if-let [args (get rule (keyword "(...)"))]
+        (let [args (if (sequential? args) args [args])]
+          (binding [*args* args]
+            (str "[parser " (str/join " " args) "]")))
+        "[parser]"))))
+
+(defn gen-debug-args [spec name]
+  (let [rule (get spec (keyword name))]
+    (if-not (map? rule)
+      ""
+      (if-let [args (get rule (keyword "(...)"))]
+        (let [args (if (sequential? args) args [args])]
+          (str ", " (str/join ", " args)))
+        ""))))
+
+(defn gen-rule [spec nums comments name]
+  (let [rule (get spec (keyword name))
+        ;; Handle (->m) and (m>0)
+        [setm rule] (cond
+                      (and (map? rule) (get rule (keyword "(->m)")))
+                      [(gen-setm false) (dissoc rule (keyword "(->m)"))]
+
+                      (and (map? rule) (get rule (keyword "(m>0)")))
+                      [(gen-setm true) (dissoc rule (keyword "(m>0)"))]
+
+                      :else ["" rule])
+        ;; Remove (...) from rule for generation
+        rule (if (map? rule) (dissoc rule (keyword "(...)")) rule)
+
+        num-key (get nums name)
+        num (when num-key (subs (clojure.core/name num-key) 1))
+        comment (get comments num "")
+        rule-name-str (rule-name name)
+        debug-args (gen-debug-args spec name)
+        rule-args (gen-rule-args spec name)
+        rule-body (binding [*num* num
+                           *setm* setm
+                           *args* (let [r (get spec name)]
+                                   (if (map? r)
+                                     (let [a (get r (keyword "(...)"))]
+                                       (if (sequential? a) a (if a [a] [])))
+                                     []))]
+                    (indent (gen rule)))]
+    (str comment
+         "(def " rule-name-str "\n"
+         "  (with-meta\n"
+         "    (fn " rule-name-str "-fn " rule-args setm "\n"
+         "      (debug-rule \"" rule-name-str "\"" debug-args ")\n"
+         "  " rule-body  ;; extra indent for the body inside fn
+         (cond
+           (str/includes? setm "if-let") ")\n      false)"  ;; close do, add else false, close if-let
+           (str/includes? setm "let [m") ")")               ;; close let
+         ")\n"
+         "    {:trace \"" rule-name-str "\" :name \"" rule-name-str "\"}))\n\n")))
+
+(defn gen-grammar-head [top]
+  (let [name (rule-name top)]
+    (str ";; This grammar was generated from https://yaml.org/spec/1.2/spec.html\n\n"
+         "(ns yaml-parser.grammar\n"
+         "  (:require [yaml-parser.parser :as p]\n"
+         "            [yaml-parser.prelude :refer [debug-rule]]))\n\n"
+         "(declare " name ")\n\n"
+         ";; TOP returns the top-level grammar rule as a vector for call to process\n"
+         "(def TOP\n"
+         "  (with-meta\n"
+         "    (fn TOP-fn [parser]\n"
+         "      ;; Return the top rule as a value that call can process\n"
+         "      [" name "])\n"
+         "    {:trace \"TOP\" :name \"TOP\"}))\n\n"
+         ";; Helper function for auto-detect\n"
+         "(defn auto_detect [parser n]\n"
+         "  (p/auto-detect parser n))\n\n"
+         "(defn auto_detect_indent [parser n]\n"
+         "  (p/auto-detect-indent parser n))\n\n"
+         "(defn empty [parser]\n"
+         "  (p/empty-rule parser))\n\n")))
+
+(defn gen-grammar [spec-text top]
+  (let [spec (yaml/parse-string spec-text)
+        comments (get-comments spec-text)
+        nums (build-nums spec)
+        rule-names (->> (keys spec)
+                        (filter #(not (str/starts-with? (name %) ":")))
+                        (map name))]
+    (str (gen-grammar-head top)
+         ;; Forward declarations for all rules
+         "(declare\n"
+         (str/join "\n" (map #(str "  " (rule-name %)) rule-names))
+         ")\n\n"
+         ;; Generate all rules
+         (str/join "" (map #(gen-rule spec nums comments %) rule-names)))))
+
+(defn -main [& args]
+  (let [opts (cli/parse-opts args {:spec {:from {:alias :f :desc "Input YAML spec file"}
+                                          :rule {:alias :r :desc "Top rule name" :default "l-yaml-stream"}}})
+        from (:from opts)
+        rule (:rule opts)]
+    (when-not from
+      (println "Usage: generate-yaml-grammar --from <spec.yaml> [--rule <top-rule>]")
+      (System/exit 1))
+    (let [spec-text (slurp from)
+          grammar (gen-grammar spec-text rule)]
+      (println grammar))))
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))

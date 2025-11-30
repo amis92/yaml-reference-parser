@@ -1,3 +1,5 @@
+/.cache/
+/CLAUDE.md
 /test/yaml-test-suite.tml
 /node_modules/
 .testml/
