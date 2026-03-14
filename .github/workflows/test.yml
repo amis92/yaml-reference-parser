@@ -8,8 +8,6 @@ on:
 
 jobs:
   test:
-    # diff-trace.tml fails on macOS (pre-existing upstream issue)
-    continue-on-error: ${{ matrix.os == 'macOS-latest' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -29,7 +27,7 @@ jobs:
       if: ${{ matrix.os == 'macOS-latest' }}
       run: |
         brew install cpanm
-        sudo cpanm -n boolean YAML::PP
+        sudo cpanm -n boolean XXX YAML::PP
 
     - name: Fetch branches
       run: |
