@@ -7,7 +7,9 @@ SPEC-PATCHED-YAML := $(BASE)/build/yaml-spec-1.2-patched.yaml
 SPEC-YAML := $(BASE)/build/yaml-spec-1.2.yaml
 SPEC-PATCH := $(BASE)/build/yaml-spec-1.2.patch
 
-.PHONY: test build clean generate
+.DELETE_ON_ERROR:
+
+default:: build
 
 build:
 	dotnet build --configuration Release --nologo -v q

@@ -16,11 +16,13 @@ jobs:
         - macOS-latest
 
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions/setup-node@v1
-      with: {node-version: 14.x}
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with: {node-version: 18}
+    - uses: actions/setup-dotnet@v4
+      with: {dotnet-version: '10.0.x'}
 
-    - name: Linux deps
+    - name: macOS deps
       if: ${{ matrix.os == 'macOS-latest' }}
       run: |
         brew install cpanm

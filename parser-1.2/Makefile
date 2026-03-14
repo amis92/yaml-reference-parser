@@ -6,6 +6,7 @@ ROOT := $(shell cd ..; pwd)
 
 ALL := \
   coffeescript \
+  csharp \
   javascript \
   perl \
 
