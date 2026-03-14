@@ -1,0 +1,2 @@
+# Shebang file must use LF line endings (required by dotnet file-based apps)
+generate_grammar.cs text eol=lf

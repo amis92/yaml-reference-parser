@@ -1,6 +1,5 @@
 ROOT := $(shell cd ../..; pwd)
 BASE := $(ROOT)/parser-1.2
-PARSER-LANG := csharp
 
 GRAMMAR := lib/Grammar.cs
 SPEC-PATCHED-YAML := $(BASE)/build/yaml-spec-1.2-patched.yaml
@@ -18,9 +17,9 @@ test:: build $(ROOT)/test/suite
 	dotnet run --configuration Release --no-build -- --test-suite $(ROOT)/test/suite/src
 
 $(GRAMMAR): $(SPEC-PATCHED-YAML) generate_grammar.cs
-	cd $(BASE) && dotnet run $(PARSER-LANG)/generate_grammar.cs -- \
+	dotnet run --file generate_grammar.cs -- \
 		--from=$(SPEC-PATCHED-YAML) --rule=l-yaml-stream \
-		> $(PARSER-LANG)/$(GRAMMAR)
+		> $(GRAMMAR)
 
 generate: $(GRAMMAR)
 

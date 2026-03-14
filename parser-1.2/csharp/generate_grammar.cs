@@ -1,6 +1,8 @@
+#!/usr/bin/env dotnet
 // YAML Grammar Generator for C#
 // Reads the YAML spec YAML file and generates Grammar.cs
-// Usage: dotnet run generate_grammar.cs -- --from <spec.yaml> [--rule <top-rule>]
+// Usage: dotnet run --file generate_grammar.cs -- --from <spec.yaml> [--rule <top-rule>]
+// Unix:  ./generate_grammar.cs --from <spec.yaml> [--rule <top-rule>]
 
 #:package YamlDotNet@16.3.0
 
@@ -39,7 +41,7 @@ static (string File, string Rule) ParseCliArgs(string[] args)
         else if (args[i] == "--rule" && i + 1 < args.Length) rule = args[++i];
         else if (args[i].StartsWith("--rule=")) rule = args[i]["--rule=".Length..];
     }
-    if (file == null) { Console.Error.WriteLine("Usage: dotnet run generate_grammar.cs -- --from <spec.yaml> [--rule <top-rule>]"); Environment.Exit(1); }
+    if (file == null) { Console.Error.WriteLine("Usage: dotnet run --file generate_grammar.cs -- --from <spec.yaml> [--rule <top-rule>]"); Environment.Exit(1); }
     return (file!, rule);
 }
 
