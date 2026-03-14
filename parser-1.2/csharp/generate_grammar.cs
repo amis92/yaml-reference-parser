@@ -1,568 +1,591 @@
-// Translate Grammar.pm (Perl) to Grammar.cs (C#).
-// Usage: dotnet run generate_grammar.cs <input-grammar.pm> <output-grammar.cs>
+// YAML Grammar Generator for C#
+// Reads the YAML spec YAML file and generates Grammar.cs
+// Usage: dotnet run generate_grammar.cs -- --from <spec.yaml> [--rule <top-rule>]
+
+#:package YamlDotNet@16.3.0
 
 using System.Text;
 using System.Text.RegularExpressions;
+using YamlDotNet.RepresentationModel;
 
-if (args.Length < 2)
-{
-    Console.Error.WriteLine("Usage: dotnet run generate_grammar.cs <input.pm> <output.cs>");
-    return 1;
-}
+// ─── Entry Point ─────────────────────────────────────────────────────
 
-var inputPath = args[0];
-var outputPath = args[1];
-
-var content = File.ReadAllText(inputPath, Encoding.UTF8);
-var rules = ParseRules(content);
+var (specFile, topRule) = ParseCliArgs(args);
+var specText = File.ReadAllText(specFile, Encoding.UTF8);
+var comments = GetComments(specText);
+var spec = LoadSpec(specText);
+var nums = BuildNums(spec);
+var ruleNames = spec.Keys.Where(k => !k.StartsWith(':')).ToList();
 
 var sb = new StringBuilder();
-sb.AppendLine("namespace YamlParser;");
-sb.AppendLine();
-sb.AppendLine("/// <summary>");
-sb.AppendLine("/// Generated from https://yaml.org/spec/1.2/spec.html");
-sb.AppendLine("/// All 211 YAML 1.2 grammar rules.");
-sb.AppendLine("/// </summary>");
-sb.AppendLine("public partial class Grammar");
-sb.AppendLine("{");
-
-foreach (var (num, name, body) in rules)
-{
-    var prms = DetectParams(body);
-    var paramTypes = GetParamTypes(prms);
-    var paramStr = string.Join(", ", prms.Zip(paramTypes, (p, t) => $"{t} {p}"));
-
-    sb.AppendLine($"    // [{num}]");
-
-    // Special rules with custom translation
-    if (name == "TOP")
-    {
-        sb.AppendLine($"    public Func {name}()");
-        sb.AppendLine("    {");
-        sb.AppendLine("        return GetFunc(\"l_yaml_stream\");");
-        sb.AppendLine("    }");
-        sb.AppendLine();
-        continue;
-    }
-
-    if (name == "l_block_sequence")
-    {
-        sb.AppendLine("    public Func l_block_sequence(int n)");
-        sb.AppendLine("    {");
-        sb.AppendLine("        var m = AutoDetectIndent(n);");
-        sb.AppendLine("        if (m == 0) return new Func(new System.Func<bool>(() => false), \"l_block_sequence\");");
-        sb.AppendLine("        var nm = AddNum(n, m);");
-        sb.AppendLine("        return All(");
-        sb.AppendLine("            Rep(1, null,");
-        sb.AppendLine("                All(");
-        sb.AppendLine("                    new object?[] { GetFunc(\"s_indent\"), nm },");
-        sb.AppendLine("                    new object?[] { GetFunc(\"c_l_block_seq_entry\"), nm }");
-        sb.AppendLine("                ))");
-        sb.AppendLine("        );");
-        sb.AppendLine("    }");
-        sb.AppendLine();
-        continue;
-    }
-
-    if (name == "s_l_block_indented")
-    {
-        sb.AppendLine("    public Func s_l_block_indented(int n, string c)");
-        sb.AppendLine("    {");
-        sb.AppendLine("        var m = AutoDetectIndent(n);");
-        sb.AppendLine("        return Any(");
-        sb.AppendLine("            All(");
-        sb.AppendLine("                new object?[] { GetFunc(\"s_indent\"), m },");
-        sb.AppendLine("                Any(");
-        sb.AppendLine("                    new object?[] { GetFunc(\"ns_l_compact_sequence\"), AddNum(n, AddNum(1, m)) },");
-        sb.AppendLine("                    new object?[] { GetFunc(\"ns_l_compact_mapping\"), AddNum(n, AddNum(1, m)) }");
-        sb.AppendLine("                )");
-        sb.AppendLine("            ),");
-        sb.AppendLine("            new object?[] { GetFunc(\"s_l_block_node\"), n, c },");
-        sb.AppendLine("            All(");
-        sb.AppendLine("                GetFunc(\"e_node\"),");
-        sb.AppendLine("                GetFunc(\"s_l_comments\")");
-        sb.AppendLine("            )");
-        sb.AppendLine("        );");
-        sb.AppendLine("    }");
-        sb.AppendLine();
-        continue;
-    }
-
-    if (name == "l_block_mapping")
-    {
-        sb.AppendLine("    public Func l_block_mapping(int n)");
-        sb.AppendLine("    {");
-        sb.AppendLine("        var m = AutoDetectIndent(n);");
-        sb.AppendLine("        if (m == 0) return new Func(new System.Func<bool>(() => false), \"l_block_mapping\");");
-        sb.AppendLine("        var nm = AddNum(n, m);");
-        sb.AppendLine("        return All(");
-        sb.AppendLine("            Rep(1, null,");
-        sb.AppendLine("                All(");
-        sb.AppendLine("                    new object?[] { GetFunc(\"s_indent\"), nm },");
-        sb.AppendLine("                    new object?[] { GetFunc(\"ns_l_block_map_entry\"), nm }");
-        sb.AppendLine("                ))");
-        sb.AppendLine("        );");
-        sb.AppendLine("    }");
-        sb.AppendLine();
-        continue;
-    }
-
-    // Generic rule translation
-    var csBody = TranslateRuleBody(body, name, prms);
-    sb.AppendLine($"    public Func {name}({paramStr})");
-    sb.AppendLine("    {");
-    sb.AppendLine($"        return {csBody};");
-    sb.AppendLine("    }");
-    sb.AppendLine();
-}
-
+sb.Append(GenGrammarHead(topRule, ruleNames));
+foreach (var name in ruleNames)
+    sb.Append(GenRule(spec, nums, comments, name));
 sb.AppendLine("}");
 
-File.WriteAllText(outputPath, sb.ToString(), Encoding.UTF8);
-Console.WriteLine($"Generated {rules.Count} rules to {outputPath}");
+Console.Write(sb.ToString());
 return 0;
 
-// ─── Rule Parsing ────────────────────────────────────────────────────
+// ─── CLI Argument Parsing ────────────────────────────────────────────
 
-static List<(string Num, string Name, string Body)> ParseRules(string content)
+static (string File, string Rule) ParseCliArgs(string[] args)
 {
-    var rules = new List<(string, string, string)>();
-    var pattern = new Regex(@"rule\s+'(\d+)',\s+(\w+)\s+=>\s+sub\s*\{(.*?)^\};",
-        RegexOptions.Singleline | RegexOptions.Multiline);
-    foreach (Match m in pattern.Matches(content))
-        rules.Add((m.Groups[1].Value, m.Groups[2].Value, m.Groups[3].Value));
-    return rules;
+    string? file = null;
+    string rule = "l-yaml-stream";
+    for (int i = 0; i < args.Length; i++)
+    {
+        if (args[i] == "--from" && i + 1 < args.Length) file = args[++i];
+        else if (args[i].StartsWith("--from=")) file = args[i]["--from=".Length..];
+        else if (args[i] == "--rule" && i + 1 < args.Length) rule = args[++i];
+        else if (args[i].StartsWith("--rule=")) rule = args[i]["--rule=".Length..];
+    }
+    if (file == null) { Console.Error.WriteLine("Usage: dotnet run generate_grammar.cs -- --from <spec.yaml> [--rule <top-rule>]"); Environment.Exit(1); }
+    return (file!, rule);
 }
 
-static List<string> DetectParams(string body)
+// ─── YAML Spec Loading ───────────────────────────────────────────────
+
+static Dictionary<string, object?> LoadSpec(string specText)
 {
-    Match m;
-    m = Regex.Match(body, @"^\s*my\s*\(\$self\)\s*=");
-    if (m.Success) return [];
+    // YamlDotNet can't parse keys like `:002` (colon-prefixed plain scalars).
+    // Quote them to work around this.
+    specText = Regex.Replace(specText, @"(?m)^(:\d+):", "\"$1\":");
+    var yaml = new YamlStream();
+    yaml.Load(new StringReader(specText));
+    var root = (YamlMappingNode)yaml.Documents[0].RootNode;
+    return ConvertMapping(root);
+}
 
-    m = Regex.Match(body, @"^\s*my\s*\(\$self,\s*\$(\w+)\)\s*=");
-    if (m.Success) return [m.Groups[1].Value];
+static Dictionary<string, object?> ConvertMapping(YamlMappingNode node)
+{
+    var result = new Dictionary<string, object?>();
+    foreach (var (key, value) in node.Children)
+        result[((YamlScalarNode)key).Value!] = ConvertNode(value);
+    return result;
+}
 
-    m = Regex.Match(body, @"^\s*my\s*\(\$self,\s*\$(\w+),\s*\$(\w+)\)\s*=");
-    if (m.Success) return [m.Groups[1].Value, m.Groups[2].Value];
+static object? ConvertNode(YamlNode node)
+{
+    if (node is YamlScalarNode s)
+    {
+        // Only treat explicit null keyword as null, not '~' (which is a valid char in the grammar)
+        if (s.Value is null or "null") return null;
+        return s.Value;
+    }
+    if (node is YamlSequenceNode seq) return seq.Children.Select(ConvertNode).ToList();
+    if (node is YamlMappingNode map) return ConvertMapping(map);
+    return null;
+}
 
-    m = Regex.Match(body, @"^\s*my\s*\(\$self,\s*\$(\w+),\s*\$(\w+),\s*\$(\w+)\)\s*=");
-    if (m.Success) return [m.Groups[1].Value, m.Groups[2].Value, m.Groups[3].Value];
+// ─── Comment Extraction ──────────────────────────────────────────────
 
+static Dictionary<string, string> GetComments(string specText)
+{
+    var comments = new Dictionary<string, string>();
+    string? currentNum = null;
+    string currentComment = "";
+
+    foreach (var line in specText.Split('\n'))
+    {
+        var m = Regex.Match(line, @"^:(\d+):.*");
+        if (m.Success)
+        {
+            if (currentNum != null) comments[currentNum] = currentComment;
+            currentNum = m.Groups[1].Value;
+            currentComment = $"    // [{currentNum}]\n";
+        }
+        else if (currentNum != null && line.StartsWith("# "))
+        {
+            var text = line[2..].Replace("\\", "\\\\");
+            currentComment += $"    // {text}\n";
+        }
+        else if (currentNum != null)
+        {
+            comments[currentNum] = currentComment;
+            currentNum = null;
+        }
+    }
+    if (currentNum != null) comments[currentNum] = currentComment;
+    return comments;
+}
+
+// ─── Build Nums Map ──────────────────────────────────────────────────
+
+static Dictionary<string, string> BuildNums(Dictionary<string, object?> spec)
+{
+    var nums = new Dictionary<string, string>();
+    foreach (var (k, v) in spec)
+        if (k.StartsWith(':') && v is string name)
+            nums[name] = k;
+    return nums;
+}
+
+// ─── Code Generation State ───────────────────────────────────────────
+
+// (GenState class at end of file)
+
+// ─── Grammar Head ────────────────────────────────────────────────────
+
+static string GenGrammarHead(string topRule, List<string> ruleNames)
+{
+    var name = RuleName(topRule);
+    var sb = new StringBuilder();
+    sb.AppendLine("namespace YamlParser;");
+    sb.AppendLine();
+    sb.AppendLine("/// <summary>");
+    sb.AppendLine("/// Generated from https://yaml.org/spec/1.2/spec.html");
+    sb.AppendLine("/// All 211 YAML 1.2 grammar rules.");
+    sb.AppendLine("/// </summary>");
+    sb.AppendLine("public abstract partial class Grammar");
+    sb.AppendLine("{");
+    sb.AppendLine("    // Abstract methods implemented by Parser");
+    sb.AppendLine("    public abstract Func GetFunc(string name);");
+    sb.AppendLine("    public abstract Func All(params object[] funcs);");
+    sb.AppendLine("    public abstract Func Any(params object[] funcs);");
+    sb.AppendLine("    public abstract Func May(object func);");
+    sb.AppendLine("    public abstract Func Rep(int min, int? max, object func);");
+    sb.AppendLine("    public abstract Func Rep2(int min, int? max, object func);");
+    sb.AppendLine("    public abstract Func Chr(char ch);");
+    sb.AppendLine("    public abstract Func Rng(char low, char high);");
+    sb.AppendLine("    public abstract Func RngHigh(int low, int high);");
+    sb.AppendLine("    public abstract Func But(params object[] funcs);");
+    sb.AppendLine("    public abstract Func Chk(string type, object expr);");
+    sb.AppendLine("    public abstract Func Case(string var_, Dictionary<string, object> map);");
+    sb.AppendLine("    public abstract object Flip(string var_, Dictionary<string, object> map);");
+    sb.AppendLine("    public abstract Func Set(string var_, object expr);");
+    sb.AppendLine("    public abstract Func If(object test, object doIfTrue);");
+    sb.AppendLine("    public abstract Func Max(int max);");
+    sb.AppendLine("    public abstract Func Exclude(Func rule);");
+    sb.AppendLine("    public abstract Func Lt(object x, object y);");
+    sb.AppendLine("    public abstract Func Le(object x, object y);");
+    sb.AppendLine("    public abstract object AddNum(int x, object y);");
+    sb.AppendLine("    public abstract object SubNum(int x, object y);");
+    sb.AppendLine("    public abstract object GetM();");
+    sb.AppendLine("    public abstract object GetT();");
+    sb.AppendLine("    public abstract int AutoDetectIndent(int n);");
+    sb.AppendLine("    public abstract object Match();");
+    sb.AppendLine("    public abstract object Len(object str);");
+    sb.AppendLine("    public abstract object Ord(object str);");
+    sb.AppendLine();
+    sb.AppendLine($"    // [000]");
+    sb.AppendLine($"    public Func TOP()");
+    sb.AppendLine("    {");
+    sb.AppendLine($"        return GetFunc(\"{name}\");");
+    sb.AppendLine("    }");
+    sb.AppendLine();
+    return sb.ToString();
+}
+
+// ─── Rule Generation ─────────────────────────────────────────────────
+
+static string GenRule(Dictionary<string, object?> spec, Dictionary<string, string> nums,
+    Dictionary<string, string> comments, string name)
+{
+    var rule = spec[name];
+    var state = new GenState();
+
+    // Get rule number
+    if (nums.TryGetValue(name, out var numKey))
+        state.Num = numKey[1..]; // strip leading ':'
+
+    // Get args
+    var ruleArgs = GetRuleArgs(rule);
+    state.Args = ruleArgs;
+
+    // Handle (->m) and (m>0)
+    string setM = "";
+    if (rule is Dictionary<string, object?> ruleMap)
+    {
+        if (ruleMap.ContainsKey("(->m)"))
+        {
+            setM = "let";
+            rule = new Dictionary<string, object?>(ruleMap);
+            ((Dictionary<string, object?>)rule).Remove("(->m)");
+        }
+        else if (ruleMap.ContainsKey("(m>0)"))
+        {
+            setM = "if-let";
+            rule = new Dictionary<string, object?>(ruleMap);
+            ((Dictionary<string, object?>)rule).Remove("(m>0)");
+        }
+
+        // Remove (...) from rule
+        if (rule is Dictionary<string, object?> rm && rm.ContainsKey("(...)"))
+        {
+            rule = new Dictionary<string, object?>(rm);
+            ((Dictionary<string, object?>)rule).Remove("(...)");
+        }
+    }
+    state.SetM = setM;
+
+    var ruleName = RuleName(name);
+    var paramStr = GenParamStr(ruleArgs);
+    var comment = comments.GetValueOrDefault(state.Num, $"    // [{state.Num}]\n");
+    var body = Gen(rule, state);
+
+    var sb = new StringBuilder();
+    sb.Append(comment);
+
+    // Special return types for delegation/value rules
+    var returnType = GetReturnType(name, rule);
+
+    if (setM == "if-let")
+    {
+        // (m>0): auto-detect-indent → m must be > 0 or return false
+        sb.AppendLine($"    public {returnType} {ruleName}({paramStr})");
+        sb.AppendLine("    {");
+        sb.AppendLine("        var m = AutoDetectIndent(n);");
+        sb.AppendLine($"        if (m == 0) return new Func(new System.Func<bool>(() => false), \"{ruleName}\");");
+        sb.AppendLine($"        var nm = AddNum(n, m);");
+        sb.AppendLine($"        return {RewriteAutoDetectBody(body, "nm")};");
+        sb.AppendLine("    }");
+    }
+    else if (setM == "let")
+    {
+        // (->m): auto-detect-indent → m is set, can be 0
+        sb.AppendLine($"    public {returnType} {ruleName}({paramStr})");
+        sb.AppendLine("    {");
+        sb.AppendLine("        var m = AutoDetectIndent(n);");
+        sb.AppendLine($"        return {body};");
+        sb.AppendLine("    }");
+    }
+    else
+    {
+        sb.AppendLine($"    public {returnType} {ruleName}({paramStr})");
+        sb.AppendLine("    {");
+        sb.AppendLine($"        return {body};");
+        sb.AppendLine("    }");
+    }
+    sb.AppendLine();
+    return sb.ToString();
+}
+
+static string GetReturnType(string name, object? rule)
+{
+    // These rules return values (not Func) - they are delegation/value rules
+    if (name == "in-flow" || name == "seq-spaces")
+        return "object";
+    if (name == "ns-flow-yaml-content" || name == "s-block-line-prefix")
+        return "object";
+    return "Func";
+}
+
+static string RewriteAutoDetectBody(string body, string nmVar)
+{
+    // For (m>0) rules, the body uses AddNum(n, m) which we precompute as nm
+    return body.Replace("AddNum(n, m)", nmVar);
+}
+
+static List<string> GetRuleArgs(object? rule)
+{
+    if (rule is not Dictionary<string, object?> map) return [];
+    if (!map.TryGetValue("(...)", out var argsVal)) return [];
+    if (argsVal is string s) return [s];
+    if (argsVal is List<object?> list) return list.Select(x => x?.ToString() ?? "").ToList();
     return [];
 }
 
-static List<string> GetParamTypes(List<string> prms)
+static string GenParamStr(List<string> args)
 {
-    return prms.Select(p => p switch
+    if (args.Count == 0) return "";
+    return string.Join(", ", args.Select(a => a switch
     {
-        "n" or "m" => "int",
-        "c" or "t" => "string",
-        _ => "int"
-    }).ToList();
+        "n" or "m" => $"int {a}",
+        "c" or "t" => $"string {a}",
+        _ => $"int {a}"
+    }));
 }
 
-// ─── Body Translation ────────────────────────────────────────────────
+// ─── Recursive Code Generation ───────────────────────────────────────
 
-static string TranslateRuleBody(string body, string name, List<string> prms)
+static string Gen(object? rule, GenState state)
 {
-    body = body.Trim();
-    body = Regex.Replace(body, @"my\s*\([^)]*\)\s*=\s*@_;\s*\n?", "");
-    body = Regex.Replace(body, @"\s*debug_rule\([^)]*\)\s+if\s+DEBUG;\s*\n?", "");
-    body = body.Trim();
-    if (body.EndsWith(';')) body = body[..^1].Trim();
-    return TranslateExpr(body);
+    return rule switch
+    {
+        Dictionary<string, object?> map => GenFromHash(map, state),
+        List<object?> list => GenFromArray(list, state),
+        string s => GenFromString(s, state),
+        int n => n.ToString(),
+        long n => n.ToString(),
+        null => "null",
+        _ => throw new Exception($"[{state.Num}] Unknown rule type: {rule.GetType()}")
+    };
 }
 
-// ─── Expression Translation ──────────────────────────────────────────
-
-static string TranslateExpr(string expr)
+static string GenArg(object? arg, GenState state)
 {
-    expr = expr.Trim();
-    while (expr.EndsWith(';')) expr = expr[..^1].Trim();
-
-    // $self->func('name')
-    var m = Regex.Match(expr, @"^\$self->func\('(\w+)'\)$");
-    if (m.Success) return $"GetFunc(\"{m.Groups[1].Value}\")";
-
-    // $self->chr(X)
-    m = Regex.Match(expr, @"^\$self->chr\((.+)\)$");
-    if (m.Success) return $"Chr({PerlChrToCSharp(m.Groups[1].Value.Trim())})";
-
-    // $self->rng(X, Y)
-    m = Regex.Match(expr, @"^\$self->rng\((.+?),\s*(.+?)\)$");
-    if (m.Success)
-    {
-        var low = PerlChrToCSharp(m.Groups[1].Value.Trim());
-        var high = PerlChrToCSharp(m.Groups[2].Value.Trim());
-        if (low.StartsWith("0x") || high.StartsWith("0x"))
-        {
-            var lowInt = low.StartsWith("0x") ? low : $"(int){low}";
-            var highInt = high.StartsWith("0x") ? high : $"(int){high}";
-            return $"RngHigh({lowInt}, {highInt})";
-        }
-        return $"Rng({low}, {high})";
-    }
-
-    return TranslateComplex(expr);
+    var saved = state.IsArg;
+    state.IsArg = true;
+    var result = Gen(arg, state);
+    state.IsArg = saved;
+    return result;
 }
 
-static string TranslateComplex(string expr)
+// ─── String Rule Generation ──────────────────────────────────────────
+
+static string GenFromString(string rule, GenState state)
 {
-    expr = expr.Trim();
+    // Hex character: x0A → Chr('\u000A')
+    var m = Regex.Match(rule, @"^x([0-9A-F]+)$");
+    if (m.Success) return $"Chr({GenHexCode(m.Groups[1].Value)})";
 
-    // $self->method(args)
-    var m = Regex.Match(expr, @"^\$self->(\w+)\((.*)\)$", RegexOptions.Singleline);
-    if (m.Success) return TranslateMethodCall(m.Groups[1].Value, m.Groups[2].Value.Trim());
+    // Rule reference: b-char, ns-plain, etc.
+    if (Regex.IsMatch(rule, @"^(?:b|c|e|l|nb|ns|s)(?:[-+][a-z0-9]+)+$"))
+        return GenMethodRef(rule);
 
-    // [ ... ] array form
-    m = Regex.Match(expr, @"^\[\s*(.+)\s*\]$", RegexOptions.Singleline);
-    if (m.Success)
+    // Single character
+    if (rule.Length == 1)
     {
-        var parts = SplitArgs(m.Groups[1].Value.Trim());
-        var translated = parts.Select(TranslateExpr);
-        return "new object?[] { " + string.Join(", ", translated) + " }";
-    }
-
-    // Plain variable $var
-    m = Regex.Match(expr, @"^\$(\w+)$");
-    if (m.Success) return m.Groups[1].Value;
-
-    // String literal
-    if (Regex.IsMatch(expr, "^\"[^\"]*\"$")) return expr;
-
-    // Number
-    if (Regex.IsMatch(expr, @"^-?\d+$")) return expr;
-
-    if (expr == "undef") return "null";
-    if (expr == "true") return "true";
-    if (expr == "false") return "false";
-
-    return $"/* TODO: {expr} */";
-}
-
-// ─── Method Call Translation ─────────────────────────────────────────
-
-static string TranslateMethodCall(string method, string argsStr)
-{
-    switch (method)
-    {
-        case "func":
-            return $"GetFunc(\"{argsStr.Trim().Trim('\'', '\"')}\")";
-
-        case "chr":
-            return $"Chr({PerlChrToCSharp(argsStr.Trim())})";
-
-        case "rng":
+        return rule switch
         {
-            var parts = SplitArgs(argsStr);
-            var low = PerlChrToCSharp(parts[0].Trim());
-            var high = PerlChrToCSharp(parts[1].Trim());
-            if (low.StartsWith("0x") || high.StartsWith("0x"))
-                return $"RngHigh({low}, {high})";
-            return $"Rng({low}, {high})";
-        }
-
-        case "all":
-        {
-            var parts = SplitArgs(argsStr);
-            var inner = string.Join(",\n            ", parts.Select(TranslateExpr));
-            return $"All(\n            {inner}\n        )";
-        }
-
-        case "any":
-        {
-            var parts = SplitArgs(argsStr);
-            var inner = string.Join(",\n            ", parts.Select(TranslateExpr));
-            return $"Any(\n            {inner}\n        )";
-        }
-
-        case "rep":
-        {
-            var a = SplitArgs(argsStr);
-            return $"Rep({TranslateExpr(a[0])}, {TranslateExpr(a[1])}, {TranslateExpr(a[2])})";
-        }
-
-        case "rep2":
-        {
-            var a = SplitArgs(argsStr);
-            return $"Rep2({TranslateExpr(a[0])}, {TranslateExpr(a[1])}, {TranslateExpr(a[2])})";
-        }
-
-        case "but":
-        {
-            var parts = SplitArgs(argsStr);
-            var inner = string.Join(",\n            ", parts.Select(TranslateExpr));
-            return $"But(\n            {inner}\n        )";
-        }
-
-        case "may":
-            return $"May({TranslateExpr(argsStr)})";
-
-        case "chk":
-        {
-            var a = SplitArgs(argsStr);
-            var typeVal = a[0].Trim().Trim('\'', '"');
-            return $"Chk(\"{typeVal}\", {TranslateExpr(a[1])})";
-        }
-
-        case "case":
-        {
-            var a = SplitArgs(argsStr);
-            return TranslateCaseMap("Case", TranslateExpr(a[0]), a[1].Trim());
-        }
-
-        case "flip":
-        {
-            var a = SplitArgs(argsStr);
-            return TranslateCaseMap("Flip", TranslateExpr(a[0]), a[1].Trim());
-        }
-
-        case "set":
-        {
-            var a = SplitArgs(argsStr);
-            var varName = a[0].Trim().Trim('\'', '"');
-            return $"Set(\"{varName}\", {TranslateExpr(a[1])})";
-        }
-
-        case "if":
-        {
-            var a = SplitArgs(argsStr);
-            return $"If({TranslateExpr(a[0])}, {TranslateExpr(a[1])})";
-        }
-
-        case "max":
-            return $"Max({argsStr.Trim()})";
-
-        case "exclude":
-            return $"Exclude({TranslateExpr(argsStr)})";
-
-        case "lt":
-        {
-            var a = SplitArgs(argsStr);
-            return $"Lt({TranslateExpr(a[0])}, {TranslateExpr(a[1])})";
-        }
-
-        case "le":
-        {
-            var a = SplitArgs(argsStr);
-            return $"Le({TranslateExpr(a[0])}, {TranslateExpr(a[1])})";
-        }
-
-        case "add":
-        {
-            var a = SplitArgs(argsStr);
-            return $"AddNum({TranslateExpr(a[0])}, {TranslateExpr(a[1])})";
-        }
-
-        case "sub":
-        {
-            var a = SplitArgs(argsStr);
-            return $"SubNum({TranslateExpr(a[0])}, {TranslateExpr(a[1])})";
-        }
-
-        case "len":
-            return $"Len({TranslateExpr(argsStr)})";
-
-        case "ord":
-            return $"Ord({TranslateExpr(argsStr)})";
-
-        case "m":
-            return "GetM()";
-
-        case "t":
-            return "GetT()";
-
-        case "match":
-            return "Match()";
-
-        default:
-            return $"/* TODO: $self->{method}({argsStr}) */";
-    }
-}
-
-// ─── Case/Flip Map Translation ───────────────────────────────────────
-
-static string TranslateCaseMap(string funcName, string varVal, string mapStr)
-{
-    var entries = ParseHash(mapStr);
-    var parts = entries.Select(e =>
-        $"        {{ \"{e.Key}\", {TranslateExpr(e.Value)} }}");
-    var inner = string.Join(",\n", parts);
-    return $"{funcName}({varVal}, new Dictionary<string, object>\n    {{\n{inner}\n    }})";
-}
-
-static List<(string Key, string Value)> ParseHash(string s)
-{
-    s = s.Trim();
-    if (s.StartsWith('{')) s = s[1..];
-    if (s.EndsWith('}')) s = s[..^1];
-    s = s.Trim();
-
-    var entries = new List<(string, string)>();
-    while (!string.IsNullOrEmpty(s) && s != ",")
-    {
-        s = s.Trim();
-        var m = Regex.Match(s, @"^'([^']+)'\s*=>\s*");
-        if (!m.Success) break;
-        var key = m.Groups[1].Value;
-        s = s[m.Length..];
-
-        var (value, rest) = ExtractValue(s);
-        entries.Add((key, value));
-        s = rest.Trim();
-        if (s.StartsWith(',')) s = s[1..];
-    }
-    return entries;
-}
-
-// ─── Value Extraction ────────────────────────────────────────────────
-
-static (string Value, string Remaining) ExtractValue(string s)
-{
-    s = s.Trim();
-
-    // String literal
-    var m = Regex.Match(s, "^\"([^\"]*)\"");
-    if (m.Success) return ($"\"{m.Groups[1].Value}\"", s[m.Length..]);
-
-    // Array ref [ ... ]
-    if (s.StartsWith('['))
-    {
-        var depth = 0;
-        for (var i = 0; i < s.Length; i++)
-        {
-            if (s[i] == '[') depth++;
-            else if (s[i] == ']') { depth--; if (depth == 0) return (s[..(i + 1)], s[(i + 1)..]); }
-        }
-    }
-
-    // Method call $self->...
-    if (s.StartsWith("$self->"))
-    {
-        var end = FindMethodEnd(s);
-        return (s[..end], s[end..]);
-    }
-
-    // Number
-    m = Regex.Match(s, @"^(-?\d+)");
-    if (m.Success) return (m.Groups[1].Value, s[m.Length..]);
-
-    // Variable
-    m = Regex.Match(s, @"^(\$\w+)");
-    if (m.Success) return (m.Groups[1].Value, s[m.Length..]);
-
-    return (s, "");
-}
-
-static int FindMethodEnd(string s)
-{
-    var m = Regex.Match(s, @"^\$self->(\w+)");
-    if (!m.Success) return s.Length;
-    var pos = m.Length;
-    if (pos >= s.Length || s[pos] != '(') return pos;
-
-    var depth = 0;
-    for (var i = pos; i < s.Length; i++)
-    {
-        if (s[i] == '(') depth++;
-        else if (s[i] == ')') { depth--; if (depth == 0) return i + 1; }
-    }
-    return s.Length;
-}
-
-// ─── Argument Splitting ──────────────────────────────────────────────
-
-static List<string> SplitArgs(string s)
-{
-    s = s.Trim();
-    var args = new List<string>();
-    var depth = 0;
-    var current = new StringBuilder();
-
-    for (var i = 0; i < s.Length; i++)
-    {
-        var c = s[i];
-        if (c is '(' or '[' or '{')
-        {
-            depth++;
-            current.Append(c);
-        }
-        else if (c is ')' or ']' or '}')
-        {
-            depth--;
-            current.Append(c);
-        }
-        else if (c == ',' && depth == 0)
-        {
-            args.Add(current.ToString().Trim());
-            current.Clear();
-        }
-        else if (c == '#' && depth == 0)
-        {
-            // Skip comment to end of line
-            while (i < s.Length && s[i] != '\n') i++;
-        }
-        else
-        {
-            current.Append(c);
-        }
-    }
-
-    var remainder = current.ToString().Trim();
-    if (remainder.Length > 0) args.Add(remainder);
-    return args;
-}
-
-// ─── Character Literal Conversion ────────────────────────────────────
-
-static string PerlChrToCSharp(string s)
-{
-    s = s.Trim();
-
-    // Handle \x{XXXX} format
-    var m = Regex.Match(s, @"^""\\x\{([0-9a-fA-F]+)\}""$");
-    if (m.Success)
-    {
-        var code = Convert.ToInt32(m.Groups[1].Value, 16);
-        return code <= 0xFFFF ? $"'\\u{code:X4}'" : $"0x{code:X}";
-    }
-
-    // Handle "X" single char string
-    m = Regex.Match(s, "^\"(.)\"$");
-    if (m.Success) return EscapeCharLiteral(m.Groups[1].Value[0]);
-
-    // Handle "\\X" escaped char
-    m = Regex.Match(s, "^\"(.*)\"$");
-    if (m.Success)
-    {
-        var ch = m.Groups[1].Value;
-        return ch switch
-        {
-            "\\\\" => "'\\\\'",
-            "\\'" => "'\\''",
-            "\\\"" => "'\"'",
-            _ => $"'{ch}'"
+            "'" => "Chr('\\'')",
+            "\\" => "Chr('\\\\')",
+            "\"" => "Chr('\"')",
+            "{" => "Chr('\\u007B')",
+            "}" => "Chr('\\u007D')",
+            "#" => "Chr('\\u0023')",
+            "@" => "Chr('\\u0040')",
+            "`" => "Chr('\\u0060')",
+            _ when state.IsArg && (rule == "m" || rule == "t") &&
+                   !state.Args.Contains(rule) && string.IsNullOrEmpty(state.SetM) =>
+                rule == "m" ? "GetM()" : "GetT()",
+            _ when state.IsArg => rule, // variable reference
+            _ => $"Chr('{rule}')"
         };
     }
 
-    // Handle 'X' single-quoted char
-    m = Regex.Match(s, "^'(.)'$");
-    if (m.Success) return EscapeCharLiteral(m.Groups[1].Value[0]);
+    // Context values
+    if (Regex.IsMatch(rule, @"^(flow|block)-(in|out|key)$") ||
+        rule is "auto-detect" or "strip" or "clip" or "keep")
+        return $"\"{rule}\"";
 
-    return s;
+    // Special rule names: <rule>
+    m = Regex.Match(rule, @"^<(\w.+)>$");
+    if (m.Success)
+    {
+        var name = m.Groups[1].Value;
+        return name switch
+        {
+            "start-of-line" => "GetFunc(\"start_of_line\")",
+            "end-of-stream" => "GetFunc(\"end_of_stream\")",
+            "empty" => "GetFunc(\"empty\")",
+            "auto-detect-indent" => "AutoDetectIndent(n)",
+            _ => $"GetFunc(\"{RuleName(name)}\")"
+        };
+    }
+
+    // Match reference
+    if (rule == "(match)") return "Match()";
+
+    // Number (including negative)
+    if (Regex.IsMatch(rule, @"^-?\d+$")) return rule;
+
+    throw new Exception($"[{state.Num}] Unknown string rule: {rule}");
 }
 
-static string EscapeCharLiteral(char ch)
+// ─── Array Rule Generation ───────────────────────────────────────────
+
+static string GenFromArray(List<object?> rule, GenState state)
 {
-    return ch switch
+    if (rule.Count == 2 && rule[0] is string x && x.StartsWith('x') &&
+        rule[1] is string y && y.StartsWith('x'))
     {
-        '\\' => "'\\\\'",
-        '\'' => "'\\''",
-        '"' => "'\"'",
-        '\t' => "'\\t'",
-        '\n' => "'\\n'",
-        '\r' => "'\\r'",
-        _ => $"'{ch}'"
+        // Range: [x20, x7E] → Rng(...)
+        var low = GenHexCode(x[1..]);
+        var high = GenHexCode(y[1..]);
+        if (low.StartsWith("0x") || high.StartsWith("0x"))
+            return $"RngHigh({(low.StartsWith("0x") ? low : $"(int){low}")}, {(high.StartsWith("0x") ? high : $"(int){high}")})";
+        return $"Rng({low}, {high})";
+    }
+    throw new Exception($"[{state.Num}] Unknown array rule type");
+}
+
+// ─── Hash Rule Generation ────────────────────────────────────────────
+
+static string GenFromHash(Dictionary<string, object?> rule, GenState state)
+{
+    // Check for (set) in the rule (used with (if))
+    var hasSet = rule.ContainsKey("(set)");
+    var keys = rule.Keys.ToList();
+
+    if (keys.Count > 1 && !hasSet)
+    {
+        if (!rule.ContainsKey("(...)") && !rule.ContainsKey("(->m)") && !rule.ContainsKey("(m>0)"))
+            throw new Exception($"[{state.Num}] Unknown keys: {string.Join(", ", keys)}");
+    }
+
+    var key = keys[0];
+    var val = rule[key];
+
+    // Fixed repetition: ({X})
+    var m = Regex.Match(key, @"^\(\{(.)\}\)$");
+    if (m.Success)
+    {
+        var n = m.Groups[1].Value;
+        return GenRep(val, n, n, state);
+    }
+
+    // Rule call with args
+    if (Regex.IsMatch(key, @"^(([bcls]|n[bs]|in|seq)[-+][-+a-z0-9]+)$"))
+        return GenCall(key, val, state);
+    if (key == "auto-detect")
+        return GenCall(key, val, state);
+
+    return key switch
+    {
+        "(any)" => GenGroup(val, "Any", state),
+        "(all)" => GenGroup(val, "All", state),
+        "(---)" => GenGroup(val, "But", state),
+        "(+++)" => GenRep(val, "1", "null", state),
+        "(***)" => GenRep(val, "0", "null", state),
+        "(???)" => GenRep(val, "0", "1", state),
+        "(<<<)" => $"May({Gen(val, state)})",
+        "(===)" => $"Chk(\"=\", {Gen(val, state)})",
+        "(!==)" => $"Chk(\"!\", {Gen(val, state)})",
+        "(<==)" => $"Chk(\"<=\", {Gen(val, state)})",
+        "(+)" => GenBinOp("AddNum", val, state),
+        "(-)" => GenBinOp("SubNum", val, state),
+        "(<)" => GenBinOpArg("Lt", val, state),
+        "(<=)" => GenBinOpArg("Le", val, state),
+        "(case)" => GenCase(val, state),
+        "(flip)" => GenFlip(val, state),
+        "(max)" => $"Max({val})",
+        "(if)" => GenIf(val, rule.GetValueOrDefault("(set)"), state),
+        "(set)" => GenSet(val, state),
+        "(ord)" => $"Ord({Gen(val, state)})",
+        "(len)" => $"Len({Gen(val, state)})",
+        "(exclude)" => $"Exclude({Gen(val, state)})",
+        _ => throw new Exception($"[{state.Num}] Unknown hash rule key: {key}")
     };
+}
+
+// ─── Compound Generators ─────────────────────────────────────────────
+
+static string GenGroup(object? items, string kind, GenState state)
+{
+    if (items is not List<object?> list) throw new Exception($"[{state.Num}] Group items not a list");
+    var savedGroup = state.IsGroup;
+    var savedRep = state.RepCount;
+    state.IsGroup = true;
+    state.RepCount = 0;
+    var parts = list.Select(item => Gen(item, state)).ToList();
+    state.IsGroup = savedGroup;
+    state.RepCount = savedRep;
+    var inner = string.Join(",\n            ", parts);
+    return $"{kind}(\n            {inner}\n        )";
+}
+
+static string GenRep(object? rule, string min, string max, GenState state)
+{
+    state.RepCount++;
+    var repFn = state.RepCount > 1 ? "Rep2" : "Rep";
+    var body = Gen(rule, state);
+    return $"{repFn}({min}, {max}, {body})";
+}
+
+static string GenCall(string callName, object? callArgs, GenState state)
+{
+    var args = callArgs is List<object?> list ? list : new List<object?> { callArgs };
+    var argsStr = string.Join(", ", args.Select(a => GenArg(a, state)));
+    var name = RuleName(callName);
+    return $"new object?[] {{ GetFunc(\"{name}\"), {argsStr} }}";
+}
+
+static string GenBinOp(string op, object? val, GenState state)
+{
+    if (val is not List<object?> list || list.Count != 2)
+        throw new Exception($"[{state.Num}] {op} requires 2 args");
+    return $"{op}({Gen(list[0], state)}, {Gen(list[1], state)})";
+}
+
+static string GenBinOpArg(string op, object? val, GenState state)
+{
+    if (val is not List<object?> list || list.Count != 2)
+        throw new Exception($"[{state.Num}] {op} requires 2 args");
+    return $"{op}({GenArg(list[0], state)}, {GenArg(list[1], state)})";
+}
+
+static string GenCase(object? val, GenState state)
+{
+    if (val is not Dictionary<string, object?> map) throw new Exception($"[{state.Num}] case needs map");
+    var varName = map["var"]?.ToString() ?? "";
+    var entries = map.Where(kv => kv.Key != "var")
+        .Select(kv => $"        {{ \"{kv.Key}\", {GenInline(kv.Value, state)} }}")
+        .ToList();
+    var inner = string.Join(",\n", entries);
+    return $"Case({varName}, new Dictionary<string, object>\n    {{\n{inner}\n    }})";
+}
+
+static string GenFlip(object? val, GenState state)
+{
+    if (val is not Dictionary<string, object?> map) throw new Exception($"[{state.Num}] flip needs map");
+    var varName = map["var"]?.ToString() ?? "";
+    var entries = map.Where(kv => kv.Key != "var")
+        .Select(kv => $"        {{ \"{kv.Key}\", {GenArg(kv.Value, state)} }}")
+        .ToList();
+    var inner = string.Join(",\n", entries);
+    return $"Flip({varName}, new Dictionary<string, object>\n    {{\n{inner}\n    }})";
+}
+
+static string GenIf(object? condVal, object? setVal, GenState state)
+{
+    var cond = Gen(condVal, state);
+    var set = setVal != null ? GenSet(setVal, state) : "null";
+    return $"If({cond}, {set})";
+}
+
+static string GenSet(object? val, GenState state)
+{
+    if (val is not List<object?> list || list.Count != 2)
+        throw new Exception($"[{state.Num}] set requires [var, expr]");
+    var varName = list[0]?.ToString() ?? "";
+    return $"Set(\"{varName}\", {Gen(list[1], state)})";
+}
+
+static string GenInline(object? val, GenState state)
+{
+    // Generate and collapse whitespace for inline use (case values)
+    var result = Gen(val, state);
+    result = Regex.Replace(result, @"\s+", " ");
+    result = Regex.Replace(result, @",\s*\)", " )");
+    return result;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+static string RuleName(string name) => name.Replace('-', '_').Replace('+', '_');
+
+static string GenMethodRef(string name)
+{
+    var csName = RuleName(name);
+    return csName switch
+    {
+        "s_indent" or "s_separate" or "s_white" or "b_char" or "b_break" or "ns_char"
+        or "b_non_content" or "b_as_line_feed" or "e_node" or "e_scalar" or "s_l_comments"
+        or "s_separate_in_line" or "c_forbidden" or "c_directives_end" or "c_document_end"
+        or "l_comment" or "l_directive" or "l_document_suffix" or "l_document_prefix"
+        or "l_any_document" or "l_explicit_document" or "l_bare_document"
+        or "l_directive_document" or "l_yaml_stream"
+            => $"GetFunc(\"{csName}\")",
+        _ => $"GetFunc(\"{csName}\")"
+    };
+}
+
+static string GenHexCode(string hex)
+{
+    var codePoint = Convert.ToInt32(hex, 16);
+    if (codePoint > 0xFFFF) return $"0x{hex}";
+    return $"'\\u{codePoint:X4}'";
+}
+
+// ─── Types (must be after top-level statements) ──────────────────────
+
+class GenState
+{
+    public string Num = "0";
+    public bool IsArg;
+    public bool IsGroup;
+    public List<string> Args = [];
+    public string SetM = "";
+    public int RepCount;
 }

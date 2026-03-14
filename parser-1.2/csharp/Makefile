@@ -3,6 +3,9 @@ BASE := $(ROOT)/parser-1.2
 PARSER-LANG := csharp
 
 GRAMMAR := lib/Grammar.cs
+SPEC-PATCHED-YAML := $(BASE)/build/yaml-spec-1.2-patched.yaml
+SPEC-YAML := $(BASE)/build/yaml-spec-1.2.yaml
+SPEC-PATCH := $(BASE)/build/yaml-spec-1.2.patch
 
 .PHONY: test build clean generate
 
@@ -12,9 +15,21 @@ build:
 test:: build $(ROOT)/test/suite
 	dotnet run --configuration Release --no-build -- --test-suite $(ROOT)/test/suite/src
 
-generate:
+$(GRAMMAR): $(SPEC-PATCHED-YAML) generate_grammar.cs
 	cd $(BASE) && dotnet run $(PARSER-LANG)/generate_grammar.cs -- \
-		perl/lib/Grammar.pm $(PARSER-LANG)/$(GRAMMAR)
+		--from=$(SPEC-PATCHED-YAML) --rule=l-yaml-stream \
+		> $(PARSER-LANG)/$(GRAMMAR)
+
+generate: $(GRAMMAR)
+
+$(SPEC-PATCHED-YAML): $(SPEC-YAML)
+	cp $< $@
+	patch $@ < $(SPEC-PATCH)
+
+$(SPEC-YAML):
+	cp $(ROOT)/../yaml-grammar/yaml-spec-1.2.yaml $@ || \
+	wget -O $@ https://raw.githubusercontent.com/yaml/yaml-grammar/master/yaml-spec-1.2.yaml || \
+	curl -o $@ https://raw.githubusercontent.com/yaml/yaml-grammar/master/yaml-spec-1.2.yaml
 
 clean::
 	dotnet clean --nologo -v q 2>/dev/null || true
